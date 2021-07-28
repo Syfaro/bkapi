@@ -11,7 +11,7 @@ build:
   artifacts:
     expire_in: 1 day
     paths:
-      - ./bkapi
+      - ./bkapi/bkapi
   cache:
     - key:
         files:
@@ -20,8 +20,8 @@ build:
         - target/
         - .cargo/
   script:
-    - cargo build --release --verbose
-    - mv ./target/release/bkapi ./bkapi
+    - cargo build --bin bkapi --release --verbose
+    - mv ./target/release/bkapi ./bkapi/bkapi
 
 docker:
   image:
