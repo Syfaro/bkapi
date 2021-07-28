@@ -1,26 +1,49 @@
+#![deny(missing_docs)]
+
+//! A client for BKApi.
+//!
+//! Provides basic types and a HTTP client for searching a BKApi instance.
+
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
+/// A search result, containing the searched information and all of the results.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchResults {
+    /// Searched hash.
     pub hash: i64,
+    /// Searched distance.
     pub distance: u64,
 
+    /// Search results.
     pub hashes: Vec<SearchResult>,
 }
 
+/// A single search result, containing information about the match.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchResult {
+    /// Result hash.
     pub hash: i64,
+    /// Distance between search and this result.
     pub distance: u64,
 }
 
+/// The BKApi client.
+#[derive(Clone)]
 pub struct BKApiClient {
+    /// Endpoint to search for results.
     pub endpoint: String,
     client: reqwest::Client,
 }
 
 impl BKApiClient {
+    /// Create a new BKApi client.
+    ///
+    /// Endpoint should be the full path to the `/search` endpoint.
+    ///
+    /// ```rust
+    /// let bkapi = BKApiClient::new("http://bkapi:3000/search");
+    /// ```
     pub fn new<E>(endpoint: E) -> Self
     where
         E: Into<String>,
@@ -31,6 +54,7 @@ impl BKApiClient {
         }
     }
 
+    /// Search for a hash with a given maximum distance.
     #[tracing::instrument(err, skip(self))]
     pub async fn search(&self, hash: i64, distance: u64) -> Result<SearchResults, reqwest::Error> {
         let results = self
@@ -50,6 +74,9 @@ impl BKApiClient {
         Ok(results)
     }
 
+    /// Search for multiple hashes given a single maximum distance.
+    ///
+    /// Results are returned in the same order as given hashes.
     #[tracing::instrument(err, skip(self))]
     pub async fn search_many(
         &self,
