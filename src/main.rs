@@ -152,6 +152,8 @@ async fn main() {
     app.with(middlewares::TidePrometheusMiddleware);
 
     app.at("/search").get(search);
+    app.at("/health").get(|_| async { Ok("OK") });
+
     app.listen(&http_listen)
         .await
         .expect_or_log("could not start web server");
