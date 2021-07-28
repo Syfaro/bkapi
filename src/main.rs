@@ -18,6 +18,7 @@ lazy_static::lazy_static! {
     static ref HTTP_REQUEST_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("http_request_duration_seconds", "Duration of HTTP requests", &["http_route", "http_method", "http_status_code"]).unwrap();
 
     static ref TREE_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("bkapi_tree_duration_seconds", "Duration of tree search time", &["distance"]).unwrap();
+    static ref TREE_ADD_DURATION: prometheus::Histogram = prometheus::register_histogram!("bkapi_tree_add_duration_seconds", "Duration to add new item to tree").unwrap();
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -250,9 +251,11 @@ async fn create_tree(
 
         // Avoid checking if each value is unique if we were told that the
         // database query only returns unique values.
+        let timer = TREE_ADD_DURATION.start_timer();
         if config.database_is_unique || tree.find_exact(&node).is_none() {
             tree.add(node);
         }
+        timer.stop_and_record();
 
         count += 1;
         if count % 250_000 == 0 {
@@ -307,6 +310,8 @@ async fn listen_for_payloads(
             tracing::debug!(hash = payload.hash, "evaluating new payload");
 
             let node: Node = payload.hash.into();
+
+            let _timer = TREE_ADD_DURATION.start_timer();
 
             let tree = tree.upgradable_read().await;
             if tree.find_exact(&node).is_some() {
