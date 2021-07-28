@@ -1,0 +1,37 @@
+stages:
+  - build
+  - image
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+build:
+  image: rust:1.53-slim-buster
+  stage: build
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - ./bkapi
+  cache:
+    - key:
+        files:
+          - Cargo.lock
+      paths:
+        - target/
+        - .cargo/
+  script:
+    - cargo build --release --verbose
+    - mv ./target/release/bkapi ./bkapi
+
+docker:
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  stage: image
+  needs:
+    - build
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
+  script:
+    - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA --destination $CI_REGISTRY_IMAGE:latest --cache=true
