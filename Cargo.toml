@@ -34,4 +34,4 @@ tide-tracing = "0.0.11"
 
 [dependencies.sqlx]
 version = "0.5"
-features = ["runtime-async-std-native-tls", "postgres"]
+features = ["runtime-async-std-rustls", "postgres"]

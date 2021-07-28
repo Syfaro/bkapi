@@ -19,9 +19,6 @@ build:
       paths:
         - target/
         - .cargo/
-  before_script:
-    - apt-get update -y
-    - apt-get install -y libssl-dev pkg-config
   script:
     - cargo build --release --verbose
     - mv ./target/release/bkapi ./bkapi
