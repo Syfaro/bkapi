@@ -161,12 +161,6 @@ fn configure_tracing(config: &Config) {
     .expect("tracing could not be configured");
 }
 
-#[derive(Clone)]
-struct State {
-    tree: tree::Tree,
-    max_distance: Option<u32>,
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct Query {
     hash: i64,
