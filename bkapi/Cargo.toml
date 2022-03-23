@@ -11,10 +11,10 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-unwrap = "0.9"
-tracing-opentelemetry = "0.16"
+tracing-opentelemetry = "0.17"
 
-opentelemetry = { version = "0.16", features = ["rt-tokio"] }
-opentelemetry-jaeger = { version = "0.15", features = ["rt-tokio"] }
+opentelemetry = { version = "0.17", features = ["rt-tokio"] }
+opentelemetry-jaeger = { version = "0.16", features = ["rt-tokio"] }
 
 lazy_static = "1"
 prometheus = { version = "0.13", features = ["process"] }
@@ -28,10 +28,10 @@ tokio = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-actix-web = "4.0.0-beta.13"
-actix-http = "3.0.0-beta.14"
+actix-web = "4"
+actix-http = "3"
 actix-service = "2"
-tracing-actix-web = { version = "0.5.0-beta.4", features = ["opentelemetry_0_16"] }
+tracing-actix-web = { version = "0.5", features = ["opentelemetry_0_17"] }
 
 [dependencies.sqlx]
 version = "0.5"
