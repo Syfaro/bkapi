@@ -141,13 +141,15 @@ fn configure_tracing(config: &Config) {
         "release"
     };
 
-    let tracer = opentelemetry_jaeger::new_pipeline()
-        .with_agent_endpoint(&config.jaeger_agent)
+    let tracer = opentelemetry_jaeger::new_agent_pipeline()
+        .with_endpoint(&config.jaeger_agent)
         .with_service_name(&config.service_name)
-        .with_tags(vec![
-            KeyValue::new("environment", env.to_owned()),
-            KeyValue::new("version", env!("CARGO_PKG_VERSION")),
-        ])
+        .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
+            opentelemetry::sdk::Resource::new(vec![
+                KeyValue::new("environment", env.to_owned()),
+                KeyValue::new("version", env!("CARGO_PKG_VERSION")),
+            ]),
+        ))
         .install_batch(opentelemetry::runtime::Tokio)
         .expect("otel jaeger pipeline could not be created");
 

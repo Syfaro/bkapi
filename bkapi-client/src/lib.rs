@@ -85,7 +85,7 @@ impl BKApiClient {
     ) -> Result<Vec<SearchResults>, reqwest::Error> {
         let mut futs = futures::stream::FuturesOrdered::new();
         for hash in hashes {
-            futs.push(self.search(*hash, distance));
+            futs.push_back(self.search(*hash, distance));
         }
 
         futs.try_collect().await
