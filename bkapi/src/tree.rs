@@ -9,6 +9,8 @@ use tracing_unwrap::ResultExt;
 use crate::{Config, Error};
 
 lazy_static::lazy_static! {
+    static ref TREE_ENTRIES: prometheus::IntCounter = prometheus::register_int_counter!("bkapi_tree_entries", "Total number of entries within tree").unwrap();
+
     static ref TREE_ADD_DURATION: prometheus::Histogram = prometheus::register_histogram!("bkapi_tree_add_duration_seconds", "Duration to add new item to tree").unwrap();
     static ref TREE_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("bkapi_tree_duration_seconds", "Duration of tree search time", &["distance"]).unwrap();
 }
@@ -64,6 +66,9 @@ impl Tree {
         let mut tree = self.tree.write().await;
         *tree = new_tree;
 
+        TREE_ENTRIES.reset();
+        TREE_ENTRIES.inc_by(count);
+
         Ok(())
     }
 
@@ -80,6 +85,7 @@ impl Tree {
         if is_new_hash {
             let mut tree = self.tree.write().await;
             tree.add(node);
+            TREE_ENTRIES.inc();
         }
 
         tracing::info!(is_new_hash, "added hash");
