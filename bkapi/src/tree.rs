@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use sqlx::{postgres::PgListener, Pool, Postgres, Row};
 use tokio::sync::RwLock;
 use tracing_unwrap::ResultExt;
 
 use crate::{Config, Error};
+
+lazy_static::lazy_static! {
+    static ref TREE_ADD_DURATION: prometheus::Histogram = prometheus::register_histogram!("bkapi_tree_add_duration_seconds", "Duration to add new item to tree").unwrap();
+}
 
 pub(crate) type Tree = Arc<RwLock<bk_tree::BKTree<Node, Hamming>>>;
 
@@ -44,13 +49,11 @@ impl From<Node> for i64 {
 /// be lost.
 async fn create_tree(
     conn: &Pool<Postgres>,
-    config: &Config,
+    query: &str,
 ) -> Result<bk_tree::BKTree<Node, Hamming>, Error> {
-    use futures::TryStreamExt;
-
     tracing::warn!("creating new tree");
     let mut tree = bk_tree::BKTree::new(Hamming);
-    let mut rows = sqlx::query(&config.database_query).fetch(conn);
+    let mut rows = sqlx::query(query).fetch(conn);
 
     let mut count = 0;
 
@@ -59,13 +62,9 @@ async fn create_tree(
     while let Some(row) = rows.try_next().await.map_err(Error::LoadingRow)? {
         let node: Node = row.get::<i64, _>(0).into();
 
-        // Avoid checking if each value is unique if we were told that the
-        // database query only returns unique values.
-        let timer = crate::TREE_ADD_DURATION.start_timer();
-        if config.database_is_unique || tree.find_exact(&node).is_none() {
+        if tree.find_exact(&node).is_none() {
             tree.add(node);
         }
-        timer.stop_and_record();
 
         count += 1;
         if count % 250_000 == 0 {
@@ -88,56 +87,122 @@ struct Payload {
 ///
 /// This will create a new tree to ensure all items are present. It will also
 /// automatically recreate trees as needed if the database connection is lost.
-pub(crate) async fn listen_for_payloads(
+pub(crate) async fn listen_for_payloads_db(
     conn: Pool<Postgres>,
-    config: Config,
+    subscription: String,
+    query: String,
     tree: Tree,
     initial: futures::channel::oneshot::Sender<()>,
 ) -> Result<(), Error> {
-    let mut listener = PgListener::connect_with(&conn)
-        .await
-        .map_err(Error::Listener)?;
-    listener
-        .listen(&config.database_subscribe)
-        .await
-        .map_err(Error::Listener)?;
-
-    let new_tree = create_tree(&conn, &config).await?;
-    {
-        let mut tree = tree.write().await;
-        *tree = new_tree;
-    }
-
-    initial
-        .send(())
-        .expect_or_log("nothing listening for initial data");
+    let mut initial = Some(initial);
 
     loop {
-        while let Some(notification) = listener.try_recv().await.map_err(Error::Listener)? {
-            let payload: Payload =
-                serde_json::from_str(notification.payload()).map_err(Error::Data)?;
-            tracing::debug!(hash = payload.hash, "evaluating new payload");
+        let mut listener = PgListener::connect_with(&conn)
+            .await
+            .map_err(Error::Listener)?;
+        listener
+            .listen(&subscription)
+            .await
+            .map_err(Error::Listener)?;
 
-            let node: Node = payload.hash.into();
-
-            let _timer = crate::TREE_ADD_DURATION.start_timer();
-
-            let mut tree = tree.write().await;
-            if tree.find_exact(&node).is_some() {
-                tracing::trace!("hash already existed in tree");
-                continue;
-            }
-
-            tracing::trace!("hash did not exist, adding to tree");
-            tree.add(node);
-        }
-
-        tracing::error!("disconnected from listener, recreating tree");
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let new_tree = create_tree(&conn, &config).await?;
+        let new_tree = create_tree(&conn, &query).await?;
         {
             let mut tree = tree.write().await;
             *tree = new_tree;
         }
+
+        if let Some(initial) = initial.take() {
+            initial
+                .send(())
+                .expect_or_log("nothing listening for initial data");
+        }
+
+        while let Some(notification) = listener.try_recv().await.map_err(Error::Listener)? {
+            tracing::trace!("got postgres payload");
+            process_payload(&tree, notification.payload().as_bytes()).await?;
+        }
+
+        tracing::error!("disconnected from postgres listener, recreating tree");
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
+}
+
+pub(crate) async fn listen_for_payloads_nats(
+    config: Config,
+    pool: sqlx::PgPool,
+    client: async_nats::Client,
+    tree: Tree,
+    initial: futures::channel::oneshot::Sender<()>,
+) -> Result<(), Error> {
+    static STREAM_NAME: &str = "bkapi-hashes";
+
+    let jetstream = async_nats::jetstream::new(client);
+    let mut initial = Some(initial);
+
+    let stream = jetstream
+        .get_or_create_stream(async_nats::jetstream::stream::Config {
+            name: STREAM_NAME.to_string(),
+            subjects: vec!["bkapi.add".to_string()],
+            max_age: std::time::Duration::from_secs(60 * 60 * 24),
+            retention: async_nats::jetstream::stream::RetentionPolicy::Interest,
+            ..Default::default()
+        })
+        .await?;
+
+    loop {
+        let consumer = stream
+            .get_or_create_consumer(
+                "bkapi-consumer",
+                async_nats::jetstream::consumer::pull::Config {
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let new_tree = create_tree(&pool, &config.database_query).await?;
+        {
+            let mut tree = tree.write().await;
+            *tree = new_tree;
+        }
+
+        if let Some(initial) = initial.take() {
+            initial
+                .send(())
+                .expect_or_log("nothing listening for initial data");
+        }
+
+        let mut messages = consumer.messages().await?;
+
+        while let Ok(Some(message)) = messages.try_next().await {
+            tracing::trace!("got nats payload");
+            message.ack().await?;
+            process_payload(&tree, &message.payload).await?;
+        }
+
+        tracing::error!("disconnected from nats listener, recreating tree");
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
+async fn process_payload(tree: &Tree, payload: &[u8]) -> Result<(), Error> {
+    let payload: Payload = serde_json::from_slice(payload).map_err(Error::Data)?;
+    tracing::trace!("got hash: {}", payload.hash);
+
+    let node: Node = payload.hash.into();
+
+    let _timer = TREE_ADD_DURATION.start_timer();
+
+    let is_new_hash = {
+        let tree = tree.read().await;
+        tree.find_exact(&node).is_none()
+    };
+
+    if is_new_hash {
+        let mut tree = tree.write().await;
+        tree.add(node);
+    }
+
+    tracing::debug!(hash = payload.hash, is_new_hash, "processed incoming hash");
+
+    Ok(())
 }

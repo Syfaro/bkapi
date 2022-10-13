@@ -5,7 +5,8 @@ authors = ["Syfaro <syfaro@huefox.com>"]
 edition = "2018"
 
 [dependencies]
-envconfig = "0.10"
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive", "env"] }
 thiserror = "1"
 
 tracing = "0.1"
@@ -32,6 +33,8 @@ actix-web = "4"
 actix-http = "3"
 actix-service = "2"
 tracing-actix-web = { version = "0.6", features = ["opentelemetry_0_17"] }
+
+async-nats = "0.21"
 
 [dependencies.sqlx]
 version = "0.6"

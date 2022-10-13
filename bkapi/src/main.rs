@@ -6,7 +6,8 @@ use actix_web::{
     web::{self, Data},
     App, HttpResponse, HttpServer, Responder,
 };
-use envconfig::Envconfig;
+use clap::Parser;
+use futures::StreamExt;
 use opentelemetry::KeyValue;
 use prometheus::{Encoder, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
@@ -21,7 +22,6 @@ lazy_static::lazy_static! {
     static ref HTTP_REQUEST_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("http_request_duration_seconds", "Duration of HTTP requests", &["http_route", "http_method", "http_status_code"]).unwrap();
 
     static ref TREE_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("bkapi_tree_duration_seconds", "Duration of tree search time", &["distance"]).unwrap();
-    static ref TREE_ADD_DURATION: prometheus::Histogram = prometheus::register_histogram!("bkapi_tree_add_duration_seconds", "Duration to add new item to tree").unwrap();
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -32,32 +32,56 @@ enum Error {
     Listener(sqlx::Error),
     #[error("listener got data that could not be decoded: {0}")]
     Data(serde_json::Error),
+    #[error("nats encountered error: {0}")]
+    Nats(#[from] async_nats::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
-#[derive(Envconfig, Clone)]
+#[derive(Parser, Clone)]
 struct Config {
-    #[envconfig(default = "0.0.0.0:3000")]
+    /// Host to listen for incoming HTTP requests.
+    #[clap(long, env, default_value = "127.0.0.1:3000")]
     http_listen: String,
-    #[envconfig(default = "127.0.0.1:6831")]
+
+    /// Jaeger agent endpoint for span collection.
+    #[clap(long, env, default_value = "127.0.0.1:6831")]
     jaeger_agent: String,
-    #[envconfig(default = "bkapi")]
+    /// Service name for spans.
+    #[clap(long, env, default_value = "bkapi")]
     service_name: String,
 
+    /// Database URL for fetching data.
+    #[clap(long, env)]
     database_url: String,
+    /// Query to perform to fetch initial values.
+    #[clap(long, env)]
     database_query: String,
-    database_subscribe: String,
-    #[envconfig(default = "false")]
-    database_is_unique: bool,
 
-    max_distance: Option<u32>,
+    /// If provided, the Postgres notification topic to subscribe to.
+    #[clap(long, env)]
+    database_subscribe: Option<String>,
+
+    /// The NATS host.
+    #[clap(long, env)]
+    nats_host: Option<String>,
+    /// The NATS NKEY.
+    #[clap(long, env)]
+    nats_nkey: Option<String>,
+
+    /// Maximum distance permitted in queries.
+    #[clap(long, env, default_value = "10")]
+    max_distance: u32,
 }
 
 #[actix_web::main]
 async fn main() {
-    let config = Config::init_from_env().expect("could not load config");
+    let _ = dotenvy::dotenv();
+
+    let config = Config::parse();
     configure_tracing(&config);
 
-    tracing::info!("starting bkbase");
+    tracing::info!("starting bkapi");
 
     let tree: tree::Tree = Arc::new(RwLock::new(bk_tree::BKTree::new(tree::Hamming)));
 
@@ -69,18 +93,46 @@ async fn main() {
         .expect_or_log("could not connect to database");
     tracing::debug!("connected to postgres");
 
-    let http_listen = config.http_listen.clone();
-
     let (sender, receiver) = futures::channel::oneshot::channel();
 
-    tracing::info!("starting to listen for payloads");
+    let client = match (config.nats_host.as_deref(), config.nats_nkey.as_deref()) {
+        (Some(host), None) => Some(
+            async_nats::connect(host)
+                .await
+                .expect_or_log("could not connect to nats with no nkey"),
+        ),
+        (Some(host), Some(nkey)) => Some(
+            async_nats::ConnectOptions::with_nkey(nkey.to_string())
+                .connect(host)
+                .await
+                .expect_or_log("could not connect to nats with nkey"),
+        ),
+        _ => None,
+    };
+
     let tree_clone = tree.clone();
     let config_clone = config.clone();
-    tokio::task::spawn(async {
-        tree::listen_for_payloads(pool, config_clone, tree_clone, sender)
-            .await
-            .expect_or_log("listenting for updates failed");
-    });
+    if let Some(client) = client.clone() {
+        tracing::info!("starting to listen for payloads from nats");
+
+        tokio::task::spawn(async {
+            tree::listen_for_payloads_nats(config_clone, pool, client, tree_clone, sender)
+                .await
+                .unwrap_or_log();
+        });
+    } else if let Some(subscription) = config.database_subscribe.clone() {
+        tracing::info!("starting to listen for payloads from postgres");
+
+        let query = config.database_query.clone();
+
+        tokio::task::spawn(async move {
+            tree::listen_for_payloads_db(pool, subscription, query, tree_clone, sender)
+                .await
+                .unwrap_or_log();
+        });
+    } else {
+        panic!("no listener source available");
+    };
 
     tracing::info!("waiting for initial tree to load");
     receiver
@@ -88,45 +140,17 @@ async fn main() {
         .expect_or_log("tree loading was dropped before completing");
     tracing::info!("initial tree loaded, starting server");
 
-    let tree = Data::new(tree);
-    let config = Data::new(config);
+    if let Some(client) = client {
+        let tree_clone = tree.clone();
+        let config_clone = config.clone();
+        tokio::task::spawn(async move {
+            search_nats(client, tree_clone, config_clone)
+                .await
+                .unwrap_or_log();
+        });
+    }
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(tracing_actix_web::TracingLogger::default())
-            .wrap_fn(|req, srv| {
-                let path = req.path().to_owned();
-                let method = req.method().to_string();
-
-                let start = std::time::Instant::now();
-                let fut = srv.call(req);
-
-                async move {
-                    let res = fut.await?;
-                    let end = std::time::Instant::now().duration_since(start);
-
-                    let status_code = res.status().as_u16().to_string();
-
-                    let labels: Vec<&str> = vec![&path, &method, &status_code];
-                    HTTP_REQUEST_COUNT.with_label_values(&labels).inc();
-                    HTTP_REQUEST_DURATION
-                        .with_label_values(&labels)
-                        .observe(end.as_secs_f64());
-
-                    Ok(res)
-                }
-            })
-            .app_data(tree.clone())
-            .app_data(config.clone())
-            .service(search)
-            .service(health)
-            .service(metrics)
-    })
-    .bind(&http_listen)
-    .expect_or_log("bind failed")
-    .run()
-    .await
-    .expect_or_log("server failed");
+    start_server(config, tree).await.unwrap_or_log();
 }
 
 fn configure_tracing(config: &Config) {
@@ -163,6 +187,64 @@ fn configure_tracing(config: &Config) {
     .expect("tracing could not be configured");
 }
 
+async fn start_server(config: Config, tree: tree::Tree) -> Result<(), Error> {
+    let tree = Data::new(tree);
+    let config_data = Data::new(config.clone());
+
+    HttpServer::new(move || {
+        App::new()
+            .wrap(tracing_actix_web::TracingLogger::default())
+            .wrap_fn(|req, srv| {
+                let path = req.path().to_owned();
+                let method = req.method().to_string();
+
+                let start = std::time::Instant::now();
+                let fut = srv.call(req);
+
+                async move {
+                    let res = fut.await?;
+                    let end = std::time::Instant::now().duration_since(start);
+
+                    let status_code = res.status().as_u16().to_string();
+
+                    let labels: Vec<&str> = vec![&path, &method, &status_code];
+                    HTTP_REQUEST_COUNT.with_label_values(&labels).inc();
+                    HTTP_REQUEST_DURATION
+                        .with_label_values(&labels)
+                        .observe(end.as_secs_f64());
+
+                    Ok(res)
+                }
+            })
+            .app_data(tree.clone())
+            .app_data(config_data.clone())
+            .service(search)
+            .service(health)
+            .service(metrics)
+    })
+    .bind(&config.http_listen)
+    .expect_or_log("bind failed")
+    .run()
+    .await
+    .map_err(Error::Io)
+}
+
+#[get("/health")]
+async fn health() -> impl Responder {
+    "OK"
+}
+
+#[get("/metrics")]
+async fn metrics() -> Result<HttpResponse, std::convert::Infallible> {
+    let mut buffer = Vec::new();
+    let encoder = TextEncoder::new();
+
+    let metric_families = prometheus::gather();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+
+    Ok(HttpResponse::Ok().body(buffer))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct Query {
     hash: i64,
@@ -189,22 +271,91 @@ async fn search(
     query: web::Query<Query>,
     tree: Data<tree::Tree>,
     config: Data<Config>,
-) -> Result<HttpResponse, std::convert::Infallible> {
+) -> HttpResponse {
     let Query { hash, distance } = query.0;
-    let max_distance = config.max_distance;
-
-    tracing::info!("searching for hash {} with distance {}", hash, distance);
-
-    if matches!(max_distance, Some(max_distance) if distance > max_distance) {
-        return Ok(HttpResponse::BadRequest().body("distance is greater than max distance"));
-    }
+    let distance = distance.clamp(0, config.max_distance);
 
     let tree = tree.read().await;
+    let hashes = search_tree(&tree, hash, distance);
+    drop(tree);
+
+    let resp = SearchResponse {
+        hash,
+        distance,
+        hashes,
+    };
+
+    HttpResponse::Ok().json(resp)
+}
+
+#[derive(serde::Deserialize)]
+struct SearchPayload {
+    hash: i64,
+    distance: u32,
+}
+
+async fn search_nats(
+    client: async_nats::Client,
+    tree: tree::Tree,
+    config: Config,
+) -> Result<(), Error> {
+    tracing::info!("subscribing to searches");
+
+    let mut sub = client
+        .queue_subscribe("bkapi.search".to_string(), "bkapi-search".to_string())
+        .await?;
+
+    while let Some(message) = sub.next().await {
+        tracing::trace!("got search message");
+
+        let reply = match message.reply {
+            Some(reply) => reply,
+            None => {
+                tracing::warn!("message had no reply subject");
+                continue;
+            }
+        };
+
+        let payloads: Vec<SearchPayload> =
+            serde_json::from_slice(&message.payload).map_err(Error::Data)?;
+
+        let tree = tree.clone();
+        let config = config.clone();
+        let client = client.clone();
+
+        tokio::task::spawn(async move {
+            let tree = tree.read().await;
+
+            let results: Vec<_> = payloads
+                .into_iter()
+                .map(|payload| (payload.hash, payload.distance.clamp(0, config.max_distance)))
+                .map(|(hash, distance)| search_tree(&tree, hash, distance))
+                .collect();
+
+            drop(tree);
+
+            client
+                .publish(reply, serde_json::to_vec(&results).unwrap_or_log().into())
+                .await
+                .unwrap_or_log();
+        });
+    }
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(tree))]
+fn search_tree(
+    tree: &bk_tree::BKTree<tree::Node, tree::Hamming>,
+    hash: i64,
+    distance: u32,
+) -> Vec<HashDistance> {
+    tracing::debug!("searching tree");
 
     let duration = TREE_DURATION
         .with_label_values(&[&distance.to_string()])
         .start_timer();
-    let matches: Vec<HashDistance> = tree
+    let results: Vec<_> = tree
         .find(&hash.into(), distance)
         .into_iter()
         .map(|item| HashDistance {
@@ -214,29 +365,6 @@ async fn search(
         .collect();
     let time = duration.stop_and_record();
 
-    tracing::debug!("found {} items in {} seconds", matches.len(), time);
-
-    let resp = SearchResponse {
-        hash,
-        distance,
-        hashes: matches,
-    };
-
-    Ok(HttpResponse::Ok().json(resp))
-}
-
-#[get("/health")]
-async fn health() -> impl Responder {
-    "OK"
-}
-
-#[get("/metrics")]
-async fn metrics() -> Result<HttpResponse, std::convert::Infallible> {
-    let mut buffer = Vec::new();
-    let encoder = TextEncoder::new();
-
-    let metric_families = prometheus::gather();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-
-    Ok(HttpResponse::Ok().body(buffer))
+    tracing::info!(time, results = results.len(), "found results");
+    results
 }
