@@ -32,7 +32,7 @@ serde_json = "1"
 actix-web = "4"
 actix-http = "3"
 actix-service = "2"
-tracing-actix-web = { version = "0.6", features = ["opentelemetry_0_17"] }
+tracing-actix-web = { version = "0.6", features = ["opentelemetry_0_18"] }
 
 async-nats = "0.21"
 
