@@ -110,21 +110,21 @@ async fn main() {
 
     let tree_clone = tree.clone();
     let config_clone = config.clone();
-    if let Some(client) = client.clone() {
-        tracing::info!("starting to listen for payloads from nats");
-
-        tokio::task::spawn(async {
-            tree::listen_for_payloads_nats(config_clone, pool, client, tree_clone, sender)
-                .await
-                .unwrap_or_log();
-        });
-    } else if let Some(subscription) = config.database_subscribe.clone() {
+    if let Some(subscription) = config.database_subscribe.clone() {
         tracing::info!("starting to listen for payloads from postgres");
 
         let query = config.database_query.clone();
 
         tokio::task::spawn(async move {
             tree::listen_for_payloads_db(pool, subscription, query, tree_clone, sender)
+                .await
+                .unwrap_or_log();
+        });
+    } else if let Some(client) = client.clone() {
+        tracing::info!("starting to listen for payloads from nats");
+
+        tokio::task::spawn(async {
+            tree::listen_for_payloads_nats(config_clone, pool, client, tree_clone, sender)
                 .await
                 .unwrap_or_log();
         });
