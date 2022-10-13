@@ -11,7 +11,7 @@ use futures::StreamExt;
 use opentelemetry::KeyValue;
 use prometheus::{Encoder, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::RwLock;
+use tracing::Instrument;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_unwrap::ResultExt;
 
@@ -20,8 +20,6 @@ mod tree;
 lazy_static::lazy_static! {
     static ref HTTP_REQUEST_COUNT: prometheus::CounterVec = prometheus::register_counter_vec!("http_requests_total", "Number of HTTP requests", &["http_route", "http_method", "http_status_code"]).unwrap();
     static ref HTTP_REQUEST_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("http_request_duration_seconds", "Duration of HTTP requests", &["http_route", "http_method", "http_status_code"]).unwrap();
-
-    static ref TREE_DURATION: prometheus::HistogramVec = prometheus::register_histogram_vec!("bkapi_tree_duration_seconds", "Duration of tree search time", &["distance"]).unwrap();
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -83,7 +81,7 @@ async fn main() {
 
     tracing::info!("starting bkapi");
 
-    let tree: tree::Tree = Arc::new(RwLock::new(bk_tree::BKTree::new(tree::Hamming)));
+    let tree = tree::Tree::new();
 
     tracing::trace!("connecting to postgres");
     let pool = PgPoolOptions::new()
@@ -235,14 +233,14 @@ async fn health() -> impl Responder {
 }
 
 #[get("/metrics")]
-async fn metrics() -> Result<HttpResponse, std::convert::Infallible> {
+async fn metrics() -> HttpResponse {
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();
 
     let metric_families = prometheus::gather();
     encoder.encode(&metric_families, &mut buffer).unwrap();
 
-    Ok(HttpResponse::Ok().body(buffer))
+    HttpResponse::Ok().body(buffer)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -252,17 +250,11 @@ struct Query {
 }
 
 #[derive(serde::Serialize)]
-struct HashDistance {
-    hash: i64,
-    distance: u32,
-}
-
-#[derive(serde::Serialize)]
 struct SearchResponse {
     hash: i64,
     distance: u32,
 
-    hashes: Vec<HashDistance>,
+    hashes: Vec<tree::HashDistance>,
 }
 
 #[get("/search")]
@@ -275,9 +267,10 @@ async fn search(
     let Query { hash, distance } = query.0;
     let distance = distance.clamp(0, config.max_distance);
 
-    let tree = tree.read().await;
-    let hashes = search_tree(&tree, hash, distance);
-    drop(tree);
+    let hashes = tree
+        .find([tree::HashDistance { hash, distance }])
+        .await
+        .remove(0);
 
     let resp = SearchResponse {
         hash,
@@ -294,12 +287,15 @@ struct SearchPayload {
     distance: u32,
 }
 
+#[tracing::instrument(skip(client, tree, config))]
 async fn search_nats(
     client: async_nats::Client,
     tree: tree::Tree,
     config: Config,
 ) -> Result<(), Error> {
     tracing::info!("subscribing to searches");
+
+    let client = Arc::new(client);
 
     let mut sub = client
         .queue_subscribe("bkapi.search".to_string(), "bkapi-search".to_string())
@@ -311,7 +307,7 @@ async fn search_nats(
         let reply = match message.reply {
             Some(reply) => reply,
             None => {
-                tracing::warn!("message had no reply subject");
+                tracing::warn!("message had no reply subject, skipping");
                 continue;
             }
         };
@@ -320,51 +316,26 @@ async fn search_nats(
             serde_json::from_slice(&message.payload).map_err(Error::Data)?;
 
         let tree = tree.clone();
-        let config = config.clone();
         let client = client.clone();
+        let max_distance = config.max_distance;
 
-        tokio::task::spawn(async move {
-            let tree = tree.read().await;
+        tokio::task::spawn(
+            async move {
+                let hashes = payloads.into_iter().map(|payload| tree::HashDistance {
+                    hash: payload.hash,
+                    distance: payload.distance.clamp(0, max_distance),
+                });
 
-            let results: Vec<_> = payloads
-                .into_iter()
-                .map(|payload| (payload.hash, payload.distance.clamp(0, config.max_distance)))
-                .map(|(hash, distance)| search_tree(&tree, hash, distance))
-                .collect();
+                let results = tree.find(hashes).await;
 
-            drop(tree);
-
-            client
-                .publish(reply, serde_json::to_vec(&results).unwrap_or_log().into())
-                .await
-                .unwrap_or_log();
-        });
+                client
+                    .publish(reply, serde_json::to_vec(&results).unwrap_or_log().into())
+                    .await
+                    .unwrap_or_log();
+            }
+            .in_current_span(),
+        );
     }
 
     Ok(())
-}
-
-#[tracing::instrument(skip(tree))]
-fn search_tree(
-    tree: &bk_tree::BKTree<tree::Node, tree::Hamming>,
-    hash: i64,
-    distance: u32,
-) -> Vec<HashDistance> {
-    tracing::debug!("searching tree");
-
-    let duration = TREE_DURATION
-        .with_label_values(&[&distance.to_string()])
-        .start_timer();
-    let results: Vec<_> = tree
-        .find(&hash.into(), distance)
-        .into_iter()
-        .map(|item| HashDistance {
-            distance: item.0,
-            hash: (*item.1).into(),
-        })
-        .collect();
-    let time = duration.stop_and_record();
-
-    tracing::info!(time, results = results.len(), "found results");
-    results
 }
