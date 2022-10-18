@@ -6,14 +6,15 @@ edition = "2018"
 
 [dependencies]
 tracing = "0.1"
-tracing-opentelemetry = "0.17"
+tracing-opentelemetry = "0.18"
 
-opentelemetry = "0.17"
-opentelemetry-http = "0.6"
+opentelemetry = "0.18"
+opentelemetry-http = "0.7"
 
 futures = "0.3"
 
 reqwest = { version = "0.11", features = ["json"] }
+async-nats = "0.21"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
