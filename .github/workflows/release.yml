@@ -18,6 +18,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build binaries
         run: |
+          sudo apt-get install protobuf-compiler
           cargo build --release --bin bkapi
           mv target/release/bkapi bkapi/bkapi
       - name: Login to GitHub Container Registry
