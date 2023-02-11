@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "bkapi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "actix-http",
  "actix-service",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "bkapi-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-nats",
  "futures",
