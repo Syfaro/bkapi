@@ -1,6 +1,6 @@
 [package]
 name = "bkapi-client"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Syfaro <syfaro@huefox.com>"]
 edition = "2018"
 publish = false
