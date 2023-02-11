@@ -119,8 +119,10 @@ pub struct BKApiNatsClient {
 /// A hash and distance.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct HashDistance {
-    hash: i64,
-    distance: u32,
+    /// Hash to search.
+    pub hash: i64,
+    /// Maximum distance from hash to include in results.
+    pub distance: u32,
 }
 
 impl BKApiNatsClient {
