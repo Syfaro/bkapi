@@ -3,3 +3,8 @@ members = [
     "bkapi",
     "bkapi-client",
 ]
+
+[workspace.metadata.release]
+sign-tag = true
+shared-version = true
+tag-name = "v{{version}}"

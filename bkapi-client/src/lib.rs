@@ -77,7 +77,6 @@ impl BKApiClient {
     /// Search for multiple hashes given a single maximum distance.
     ///
     /// Results are returned in the same order as given hashes.
-    #[tracing::instrument(err, skip(self))]
     pub async fn search_many(
         &self,
         hashes: &[i64],

@@ -3,6 +3,7 @@ name = "bkapi"
 version = "0.1.0"
 authors = ["Syfaro <syfaro@huefox.com>"]
 edition = "2018"
+publish = false
 
 [dependencies]
 dotenvy = "0.15"
@@ -11,7 +12,7 @@ thiserror = "1"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-unwrap = "0.9"
+tracing-unwrap = "0.10"
 tracing-opentelemetry = "0.18"
 
 opentelemetry = { version = "0.18", features = ["rt-tokio"] }
@@ -32,9 +33,11 @@ serde_json = "1"
 actix-web = "4"
 actix-http = "3"
 actix-service = "2"
-tracing-actix-web = { version = "0.6", features = ["opentelemetry_0_18"] }
+tracing-actix-web = { version = "0.7", features = ["opentelemetry_0_18"] }
 
-async-nats = "0.21"
+async-nats = "0.27"
+
+foxlib = { git = "https://github.com/Syfaro/foxlib.git" }
 
 [dependencies.sqlx]
 version = "0.6"

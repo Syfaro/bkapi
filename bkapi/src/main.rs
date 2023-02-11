@@ -1,18 +1,15 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use actix_service::Service;
 use actix_web::{
     get,
     web::{self, Data},
-    App, HttpResponse, HttpServer, Responder,
+    App, HttpResponse, HttpServer,
 };
 use clap::Parser;
 use futures::StreamExt;
-use opentelemetry::KeyValue;
-use prometheus::{Encoder, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
 use tracing::Instrument;
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_unwrap::ResultExt;
 
 mod tree;
@@ -42,12 +39,12 @@ struct Config {
     #[clap(long, env, default_value = "127.0.0.1:3000")]
     http_listen: String,
 
-    /// Jaeger agent endpoint for span collection.
-    #[clap(long, env, default_value = "127.0.0.1:6831")]
-    jaeger_agent: String,
-    /// Service name for spans.
-    #[clap(long, env, default_value = "bkapi")]
-    service_name: String,
+    /// Host to listen for metrics requests.
+    #[clap(long, env, default_value = "127.0.0.1:3001")]
+    metrics_host: SocketAddr,
+    /// If logs should be output in JSON format and sent to otlp collector.
+    #[clap(long, env)]
+    json_logs: bool,
 
     /// Database URL for fetching data.
     #[clap(long, env)]
@@ -77,9 +74,17 @@ async fn main() {
     let _ = dotenvy::dotenv();
 
     let config = Config::parse();
-    configure_tracing(&config);
+
+    foxlib::trace_init(foxlib::TracingConfig {
+        namespace: "bkapi",
+        name: "bkapi",
+        version: env!("CARGO_PKG_VERSION"),
+        otlp: config.json_logs,
+    });
 
     tracing::info!("starting bkapi");
+
+    let metrics_server = foxlib::MetricsServer::serve(config.metrics_host, false).await;
 
     let tree = tree::Tree::new();
 
@@ -136,7 +141,9 @@ async fn main() {
     receiver
         .await
         .expect_or_log("tree loading was dropped before completing");
+
     tracing::info!("initial tree loaded, starting server");
+    metrics_server.set_ready(true);
 
     if let Some(client) = client {
         let tree_clone = tree.clone();
@@ -149,40 +156,6 @@ async fn main() {
     }
 
     start_server(config, tree).await.unwrap_or_log();
-}
-
-fn configure_tracing(config: &Config) {
-    opentelemetry::global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
-
-    let env = std::env::var("ENVIRONMENT");
-    let env = if let Ok(env) = env.as_ref() {
-        env.as_str()
-    } else if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let tracer = opentelemetry_jaeger::new_agent_pipeline()
-        .with_endpoint(&config.jaeger_agent)
-        .with_service_name(&config.service_name)
-        .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
-            opentelemetry::sdk::Resource::new(vec![
-                KeyValue::new("environment", env.to_owned()),
-                KeyValue::new("version", env!("CARGO_PKG_VERSION")),
-            ]),
-        ))
-        .install_batch(opentelemetry::runtime::Tokio)
-        .expect("otel jaeger pipeline could not be created");
-
-    let trace = tracing_opentelemetry::layer().with_tracer(tracer);
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::Registry::default()
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(trace)
-            .with(tracing_subscriber::fmt::layer()),
-    )
-    .expect("tracing could not be configured");
 }
 
 async fn start_server(config: Config, tree: tree::Tree) -> Result<(), Error> {
@@ -217,30 +190,12 @@ async fn start_server(config: Config, tree: tree::Tree) -> Result<(), Error> {
             .app_data(tree.clone())
             .app_data(config_data.clone())
             .service(search)
-            .service(health)
-            .service(metrics)
     })
     .bind(&config.http_listen)
     .expect_or_log("bind failed")
     .run()
     .await
     .map_err(Error::Io)
-}
-
-#[get("/health")]
-async fn health() -> impl Responder {
-    "OK"
-}
-
-#[get("/metrics")]
-async fn metrics() -> HttpResponse {
-    let mut buffer = Vec::new();
-    let encoder = TextEncoder::new();
-
-    let metric_families = prometheus::gather();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-
-    HttpResponse::Ok().body(buffer)
 }
 
 #[derive(Debug, serde::Deserialize)]

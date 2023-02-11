@@ -2,61 +2,37 @@ name: Release
 
 on:
   push:
-  pull_request:
+    tags:
+    - "*"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   release:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Cache target
-        uses: actions/cache@v2
-        with:
-          path: |
-            target/
-          key: ${{ runner.os }}-debug-${{ hashFiles('Cargo.lock') }}
-
-      - name: Get stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build binaries
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release
-
-      - name: Move binaries
         run: |
+          cargo build --release --bin bkapi
           mv target/release/bkapi bkapi/bkapi
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v2
-        with:
-          name: bkapi
-          path: bkapi/bkapi
-
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v1
+        uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Extract metadata for Docker
         id: meta
-        uses: docker/metadata-action@v3
+        uses: docker/metadata-action@v4
         with:
           images: ghcr.io/syfaro/bkapi
-
       - name: Build and push Docker image
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v4
         with:
           context: .
           push: true

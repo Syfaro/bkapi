@@ -166,7 +166,7 @@ struct Payload {
 }
 
 /// Listen for incoming payloads from Postgres.
-#[tracing::instrument(skip(conn, subscription, query, tree, initial))]
+#[tracing::instrument(skip_all)]
 pub(crate) async fn listen_for_payloads_db(
     conn: Pool<Postgres>,
     subscription: String,
@@ -204,7 +204,7 @@ pub(crate) async fn listen_for_payloads_db(
 }
 
 /// Listen for incoming payloads from NATS.
-#[tracing::instrument(skip(config, pool, client, tree, initial))]
+#[tracing::instrument(skip_all)]
 pub(crate) async fn listen_for_payloads_nats(
     config: Config,
     pool: sqlx::PgPool,
