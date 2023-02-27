@@ -13,7 +13,7 @@ async-nats = { version = "0.27", optional = true }
 futures = "0.3"
 opentelemetry = "0.18"
 opentelemetry-http = "0.7"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
