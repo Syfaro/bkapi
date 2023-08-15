@@ -415,9 +415,13 @@ async fn handle_search_nats(
 
 #[get("/dump")]
 async fn dump(tree: Data<tree::Tree>) -> HttpResponse {
+    tracing::info!("starting dump request");
     let (wtr, rdr) = tokio::io::duplex(4096);
 
+    let span = tracing::info_span!("dump_blocking");
     tokio::task::spawn_blocking(move || {
+        let _entered = span.entered();
+
         let tree = tree.tree.blocking_read();
 
         let bridge = tokio_util::io::SyncIoBridge::new(wtr);
