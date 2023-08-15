@@ -6,9 +6,12 @@ use actix_web::{
     web::{self, Data},
     App, HttpResponse, HttpServer,
 };
+use async_nats::service::ServiceExt;
 use clap::Parser;
-use futures::StreamExt;
+use flate2::{write::GzEncoder, Compression};
+use futures::{StreamExt, TryStreamExt};
 use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing_unwrap::ResultExt;
 
@@ -28,9 +31,25 @@ enum Error {
     #[error("listener got data that could not be decoded: {0}")]
     Data(serde_json::Error),
     #[error("nats encountered error: {0}")]
-    Nats(#[from] async_nats::Error),
+    Nats(#[from] NatsError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+enum NatsError {
+    #[error("{0}")]
+    Subscribe(#[from] async_nats::SubscribeError),
+    #[error("{0}")]
+    CreateStream(#[from] async_nats::jetstream::context::CreateStreamError),
+    #[error("{0}")]
+    Consumer(#[from] async_nats::jetstream::stream::ConsumerError),
+    #[error("{0}")]
+    Stream(#[from] async_nats::jetstream::consumer::StreamError),
+    #[error("{0}")]
+    Request(#[from] async_nats::jetstream::context::RequestError),
+    #[error("{0}")]
+    Generic(#[from] async_nats::Error),
 }
 
 #[derive(Parser, Clone)]
@@ -58,11 +77,14 @@ struct Config {
     database_subscribe: Option<String>,
 
     /// The NATS host.
-    #[clap(long, env)]
+    #[clap(long, env, requires = "nats_prefix")]
     nats_host: Option<String>,
     /// The NATS NKEY.
     #[clap(long, env)]
     nats_nkey: Option<String>,
+    /// A prefix to use for NATS subjects.
+    #[clap(long, env)]
+    nats_prefix: Option<String>,
 
     /// Maximum distance permitted in queries.
     #[clap(long, env, default_value = "10")]
@@ -83,6 +105,8 @@ async fn main() {
     });
 
     tracing::info!("starting bkapi");
+
+    let token = CancellationToken::new();
 
     let metrics_server = foxlib::MetricsServer::serve(config.metrics_host, false).await;
 
@@ -115,24 +139,26 @@ async fn main() {
 
     let tree_clone = tree.clone();
     let config_clone = config.clone();
-    if let Some(subscription) = config.database_subscribe.clone() {
+    let mut listener_task = if let Some(subscription) = config.database_subscribe.clone() {
         tracing::info!("starting to listen for payloads from postgres");
-
-        let query = config.database_query.clone();
-
-        tokio::task::spawn(async move {
-            tree::listen_for_payloads_db(pool, subscription, query, tree_clone, sender)
-                .await
-                .unwrap_or_log();
-        });
+        tokio::spawn(tree::listen_for_payloads_db(
+            pool,
+            subscription,
+            config.database_query.clone(),
+            tree_clone,
+            sender,
+            token.clone(),
+        ))
     } else if let Some(client) = client.clone() {
         tracing::info!("starting to listen for payloads from nats");
-
-        tokio::task::spawn(async {
-            tree::listen_for_payloads_nats(config_clone, pool, client, tree_clone, sender)
-                .await
-                .unwrap_or_log();
-        });
+        tokio::spawn(tree::listen_for_payloads_nats(
+            config_clone,
+            pool,
+            client,
+            tree_clone,
+            sender,
+            token.clone(),
+        ))
     } else {
         panic!("no listener source available");
     };
@@ -146,19 +172,48 @@ async fn main() {
     metrics_server.set_ready(true);
 
     if let Some(client) = client {
-        let tree_clone = tree.clone();
-        let config_clone = config.clone();
-        tokio::task::spawn(async move {
-            search_nats(client, tree_clone, config_clone)
+        let tree = tree.clone();
+        let config = config.clone();
+        let token = token.clone();
+
+        tokio::spawn(async move {
+            search_nats(client, tree, config, token)
                 .await
                 .unwrap_or_log();
         });
     }
 
-    start_server(config, tree).await.unwrap_or_log();
+    let mut server = start_server(config, tree);
+    let server_handle = server.handle();
+
+    tokio::spawn({
+        let token = token.clone();
+
+        async move {
+            tokio::signal::ctrl_c()
+                .await
+                .expect_or_log("ctrl+c handler failed to install");
+            token.cancel();
+        }
+    });
+
+    tokio::select! {
+        _ = token.cancelled() => {
+            tracing::info!("got cancellation, stopping server");
+            let _ = tokio::join!(server_handle.stop(true), server, listener_task);
+        }
+        res = &mut listener_task => {
+            tracing::error!("listener task ended: {res:?}");
+            let _ = tokio::join!(server_handle.stop(true), server);
+        }
+        res = &mut server => {
+            tracing::error!("server ended: {res:?}");
+            let _ = tokio::join!(server_handle.stop(true), listener_task);
+        }
+    }
 }
 
-async fn start_server(config: Config, tree: tree::Tree) -> Result<(), Error> {
+fn start_server(config: Config, tree: tree::Tree) -> actix_web::dev::Server {
     let tree = Data::new(tree);
     let config_data = Data::new(config.clone());
 
@@ -190,12 +245,12 @@ async fn start_server(config: Config, tree: tree::Tree) -> Result<(), Error> {
             .app_data(tree.clone())
             .app_data(config_data.clone())
             .service(search)
+            .service(dump)
     })
     .bind(&config.http_listen)
     .expect_or_log("bind failed")
+    .disable_signals()
     .run()
-    .await
-    .map_err(Error::Io)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -242,43 +297,52 @@ struct SearchPayload {
     distance: u32,
 }
 
-#[tracing::instrument(skip(client, tree, config))]
+#[tracing::instrument(skip_all)]
 async fn search_nats(
     client: async_nats::Client,
     tree: tree::Tree,
     config: Config,
+    token: CancellationToken,
 ) -> Result<(), Error> {
     tracing::info!("subscribing to searches");
 
     let client = Arc::new(client);
     let max_distance = config.max_distance;
 
-    let mut sub = client
-        .queue_subscribe("bkapi.search".to_string(), "bkapi-search".to_string())
-        .await?;
-
-    while let Some(message) = sub.next().await {
-        tracing::trace!("got search message");
-
-        let reply = match message.reply {
-            Some(reply) => reply,
-            None => {
-                tracing::warn!("message had no reply subject, skipping");
-                continue;
-            }
-        };
-
-        if let Err(err) = handle_search_nats(
-            max_distance,
-            client.clone(),
-            tree.clone(),
-            reply,
-            &message.payload,
-        )
+    let service = client
+        .add_service(async_nats::service::Config {
+            name: "bkapi-search".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            description: None,
+            stats_handler: None,
+            metadata: None,
+        })
         .await
-        {
-            tracing::error!("could not handle nats search: {err}");
+        .map_err(NatsError::Generic)?;
+
+    let mut endpoint = service
+        .endpoint(format!("{}.bkapi.search", config.nats_prefix.unwrap()))
+        .await
+        .map_err(NatsError::Generic)?;
+
+    loop {
+        tokio::select! {
+            Some(request) = endpoint.next() => {
+                tracing::trace!("got search message");
+
+                if let Err(err) = handle_search_nats(max_distance, tree.clone(), request).await {
+                    tracing::error!("could not handle nats search: {err}");
+                }
+            }
+            _ = token.cancelled() => {
+                tracing::info!("cancelled, stopping endpoint");
+                break;
+            }
         }
+    }
+
+    if let Err(err) = endpoint.stop().await {
+        tracing::error!("could not stop endpoint: {err}");
     }
 
     Ok(())
@@ -286,12 +350,24 @@ async fn search_nats(
 
 async fn handle_search_nats(
     max_distance: u32,
-    client: Arc<async_nats::Client>,
     tree: tree::Tree,
-    reply: String,
-    payload: &[u8],
+    request: async_nats::service::Request,
 ) -> Result<(), Error> {
-    let payloads: Vec<SearchPayload> = serde_json::from_slice(payload).map_err(Error::Data)?;
+    let payloads: Vec<SearchPayload> = match serde_json::from_slice(&request.message.payload) {
+        Ok(payloads) => payloads,
+        Err(err) => {
+            let err = Err(async_nats::service::error::Error {
+                status: err.to_string(),
+                code: 400,
+            });
+
+            if let Err(err) = request.respond(err).await {
+                tracing::error!("could not respond with error: {err}");
+            }
+
+            return Ok(());
+        }
+    };
 
     tokio::task::spawn(
         async move {
@@ -302,20 +378,60 @@ async fn handle_search_nats(
 
             let results = tree.find(hashes).await;
 
-            if let Err(err) = client
-                .publish(
-                    reply,
-                    serde_json::to_vec(&results)
-                        .expect_or_log("results could not be serialized")
-                        .into(),
-                )
-                .await
-            {
-                tracing::error!("could not publish results: {err}");
+            let resp = serde_json::to_vec(&results).map(Into::into).map_err(|err| {
+                async_nats::service::error::Error {
+                    status: err.to_string(),
+                    code: 503,
+                }
+            });
+
+            if let Err(err) = request.respond(resp).await {
+                tracing::error!("could not respond: {err}");
             }
         }
         .in_current_span(),
     );
 
     Ok(())
+}
+
+#[get("/dump")]
+async fn dump(tree: Data<tree::Tree>) -> HttpResponse {
+    let (wtr, rdr) = tokio::io::duplex(4096);
+
+    tokio::task::spawn_blocking(move || {
+        let tree = tree.tree.blocking_read();
+
+        let bridge = tokio_util::io::SyncIoBridge::new(wtr);
+        let mut compressor = GzEncoder::new(bridge, Compression::default());
+
+        if let Err(err) = bincode::serde::encode_into_std_write(
+            &*tree,
+            &mut compressor,
+            bincode::config::standard(),
+        ) {
+            tracing::error!("could not write tree to compressor: {err}");
+        }
+
+        match compressor.finish() {
+            Ok(mut file) => match file.shutdown() {
+                Ok(_) => tracing::info!("finished writing dump"),
+                Err(err) => tracing::error!("could not finish writing dump: {err}"),
+            },
+            Err(err) => {
+                tracing::error!("could not finish compressor: {err}");
+            }
+        }
+    });
+
+    let stream = tokio_util::codec::FramedRead::new(rdr, tokio_util::codec::BytesCodec::new())
+        .map_ok(|b| b.freeze());
+
+    HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .insert_header((
+            "content-disposition",
+            r#"attachment; filename="bkapi-dump.dat.gz""#,
+        ))
+        .streaming(stream)
 }

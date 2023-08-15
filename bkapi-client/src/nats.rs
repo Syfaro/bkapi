@@ -4,6 +4,7 @@ use crate::{SearchResult, SearchResults};
 #[derive(Clone)]
 pub struct BKApiNatsClient {
     client: async_nats::Client,
+    subject: String,
 }
 
 /// A hash and distance.
@@ -19,8 +20,11 @@ impl BKApiNatsClient {
     const NATS_SUBJECT: &str = "bkapi.search";
 
     /// Create a new client with a given NATS client.
-    pub fn new(client: async_nats::Client) -> Self {
-        Self { client }
+    pub fn new(client: async_nats::Client, prefix: &str) -> Self {
+        Self {
+            client,
+            subject: format!("{}.{}", prefix, Self::NATS_SUBJECT),
+        }
     }
 
     /// Search for a single hash.
@@ -48,7 +52,7 @@ impl BKApiNatsClient {
 
         let message = self
             .client
-            .request(Self::NATS_SUBJECT.to_string(), payload.into())
+            .request(self.subject.clone(), payload.into())
             .await?;
 
         let results: Vec<Vec<HashDistance>> = serde_json::from_slice(&message.payload).unwrap();

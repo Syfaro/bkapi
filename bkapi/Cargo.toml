@@ -6,36 +6,30 @@ edition = "2018"
 publish = false
 
 [dependencies]
-dotenvy = "0.15"
-clap = { version = "4", features = ["derive", "env"] }
-thiserror = "1"
-
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-unwrap = "0.10"
-tracing-opentelemetry = "0.18"
-
-opentelemetry = { version = "0.18", features = ["rt-tokio"] }
-opentelemetry-jaeger = { version = "0.17", features = ["rt-tokio"] }
-
-lazy_static = "1"
-prometheus = { version = "0.13", features = ["process"] }
-
-bk-tree = "0.4.0"
-hamming = "0.1"
-
-futures = "0.3"
-tokio = { version = "1", features = ["sync"] }
-
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-actix-web = "4"
 actix-http = "3"
 actix-service = "2"
+actix-web = "4"
+async-nats = { version = "0.31", features = ["service"] }
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
+bk-tree = { version = "0.5.0", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+flate2 = "1"
+futures = "0.3"
+hamming = "0.1"
+lazy_static = "1"
+opentelemetry = { version = "0.18", features = ["rt-tokio"] }
+prometheus = { version = "0.13", features = ["process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+tracing = "0.1"
 tracing-actix-web = { version = "0.7", features = ["opentelemetry_0_18"] }
-
-async-nats = "0.27"
+tracing-opentelemetry = "0.18"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-unwrap = "0.10"
 
 foxlib = { git = "https://github.com/Syfaro/foxlib.git" }
 

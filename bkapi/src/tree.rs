@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
+use async_nats::jetstream::consumer::DeliverPolicy;
 use bk_tree::BKTree;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgListener, Pool, Postgres, Row};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing_unwrap::ResultExt;
 
-use crate::{Config, Error};
+use crate::{Config, Error, NatsError};
 
 lazy_static::lazy_static! {
     static ref TREE_ENTRIES: prometheus::IntCounter = prometheus::register_int_counter!("bkapi_tree_entries", "Total number of entries within tree").unwrap();
@@ -18,7 +21,7 @@ lazy_static::lazy_static! {
 /// A BKTree wrapper to cover common operations.
 #[derive(Clone)]
 pub struct Tree {
-    tree: Arc<RwLock<BKTree<Node, Hamming>>>,
+    pub tree: Arc<RwLock<BKTree<Node, Hamming>>>,
 }
 
 /// A hash and distance pair. May be used for searching or in search results.
@@ -116,7 +119,6 @@ impl Tree {
             .start_timer();
         let results: Vec<_> = tree
             .find(&hash.into(), distance)
-            .into_iter()
             .map(|item| HashDistance {
                 distance: item.0,
                 hash: (*item.1).into(),
@@ -130,7 +132,8 @@ impl Tree {
 }
 
 /// A hamming distance metric.
-struct Hamming;
+#[derive(Serialize, Deserialize)]
+pub struct Hamming;
 
 impl bk_tree::Metric<Node> for Hamming {
     fn distance(&self, a: &Node, b: &Node) -> u32 {
@@ -144,8 +147,8 @@ impl bk_tree::Metric<Node> for Hamming {
 }
 
 /// A value of a node in the BK tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Node([u8; 8]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Node([u8; 8]);
 
 impl From<i64> for Node {
     fn from(num: i64) -> Self {
@@ -173,6 +176,7 @@ pub(crate) async fn listen_for_payloads_db(
     query: String,
     tree: Tree,
     initial: futures::channel::oneshot::Sender<()>,
+    token: CancellationToken,
 ) -> Result<(), Error> {
     let mut initial = Some(initial);
 
@@ -193,13 +197,38 @@ pub(crate) async fn listen_for_payloads_db(
                 .expect_or_log("nothing listening for initial data");
         }
 
-        while let Some(notification) = listener.try_recv().await.map_err(Error::Listener)? {
-            tracing::trace!("got postgres payload");
-            process_payload(&tree, notification.payload().as_bytes()).await?;
+        loop {
+            tokio::select! {
+                res = listener.try_recv() => {
+                    match res {
+                        Ok(Some(notification)) => {
+                            tracing::trace!("got postgres payload");
+                            process_payload(&tree, notification.payload().as_bytes()).await?;
+                        }
+                        Ok(None) => {
+                            tracing::warn!("got none value from recv");
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::error!("got recv error: {err}");
+                            break;
+                        }
+                    }
+                }
+                _ = token.cancelled() => {
+                    tracing::info!("got cancellation");
+                    break;
+                }
+            }
         }
 
-        tracing::error!("disconnected from postgres listener, recreating tree");
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        if token.is_cancelled() {
+            tracing::info!("cancelled, stopping db listener");
+            return Ok(());
+        } else {
+            tracing::error!("disconnected from postgres listener, recreating tree");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
     }
 }
 
@@ -211,53 +240,89 @@ pub(crate) async fn listen_for_payloads_nats(
     client: async_nats::Client,
     tree: Tree,
     initial: futures::channel::oneshot::Sender<()>,
+    token: CancellationToken,
 ) -> Result<(), Error> {
     let jetstream = async_nats::jetstream::new(client);
     let mut initial = Some(initial);
 
     let stream = jetstream
         .get_or_create_stream(async_nats::jetstream::stream::Config {
-            name: "bkapi-hashes".to_string(),
-            subjects: vec!["bkapi.add".to_string()],
-            max_age: std::time::Duration::from_secs(60 * 60 * 24),
-            retention: async_nats::jetstream::stream::RetentionPolicy::Interest,
+            name: format!(
+                "{}-bkapi-hashes",
+                config.nats_prefix.clone().unwrap().replace('.', "-")
+            ),
+            subjects: vec![format!("{}.bkapi.add", config.nats_prefix.unwrap())],
+            max_age: std::time::Duration::from_secs(60 * 30),
+            retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
             ..Default::default()
         })
-        .await?;
+        .await
+        .map_err(NatsError::CreateStream)?;
+
+    // Because we're tracking the last sequence ID before we load tree data,
+    // we don't need to start the listener until after it's loaded. This
+    // prevents issues with a slow client but still retains every hash.
+    let mut seq = stream.cached_info().state.last_sequence;
+
+    let create_consumer = |stream: async_nats::jetstream::stream::Stream, start_sequence: u64| async move {
+        tracing::info!(start_sequence, "creating consumer");
+
+        stream
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                deliver_policy: if start_sequence > 0 {
+                    DeliverPolicy::ByStartSequence { start_sequence }
+                } else {
+                    DeliverPolicy::All
+                },
+                ..Default::default()
+            })
+            .await
+            .map_err(NatsError::Consumer)
+    };
+
+    tree.reload(&pool, &config.database_query).await?;
+
+    if let Some(initial) = initial.take() {
+        initial
+            .send(())
+            .expect_or_log("nothing listening for initial data");
+    }
 
     loop {
-        let consumer = stream
-            .get_or_create_consumer(
-                "bkapi-consumer",
-                async_nats::jetstream::consumer::pull::Config {
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let consumer = create_consumer(stream.clone(), seq).await?;
 
-        tree.reload(&pool, &config.database_query).await?;
-
-        if let Some(initial) = initial.take() {
-            initial
-                .send(())
-                .expect_or_log("nothing listening for initial data");
-        }
-
-        let mut messages = consumer.messages().await?;
+        let messages = consumer
+            .messages()
+            .await
+            .map_err(NatsError::Stream)?
+            .take_until(token.cancelled());
+        tokio::pin!(messages);
 
         while let Ok(Some(message)) = messages.try_next().await {
-            tracing::trace!("got nats payload");
-            message.ack().await?;
             process_payload(&tree, &message.payload).await?;
+
+            message.ack().await.map_err(NatsError::Generic)?;
+            seq = message
+                .info()
+                .expect_or_log("message missing info")
+                .stream_sequence;
         }
 
-        tracing::error!("disconnected from nats listener, recreating tree");
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        if token.is_cancelled() {
+            tracing::info!("cancelled, stopping nats listener");
+            return Ok(());
+        } else {
+            tracing::error!("disconnected from nats listener");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
     }
 }
 
 /// Process a payload from Postgres or NATS and add to the tree.
+#[tracing::instrument(skip_all)]
 async fn process_payload(tree: &Tree, payload: &[u8]) -> Result<(), Error> {
+    tracing::trace!("got payload: {}", String::from_utf8_lossy(payload));
+
     let payload: Payload = serde_json::from_slice(payload).map_err(Error::Data)?;
     tracing::trace!("got hash: {}", payload.hash);
 
