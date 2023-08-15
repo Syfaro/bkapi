@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use actix_service::Service;
 use actix_web::{
@@ -73,16 +73,16 @@ struct Config {
     database_query: String,
 
     /// If provided, the Postgres notification topic to subscribe to.
-    #[clap(long, env)]
+    #[clap(long, env, required_unless_present = "nats_url")]
     database_subscribe: Option<String>,
 
-    /// The NATS host.
+    /// NATS URLs.
     #[clap(long, env, requires = "nats_prefix")]
-    nats_host: Option<String>,
-    /// The NATS NKEY.
+    nats_url: Option<String>,
+    /// Path to NATS credential file.
     #[clap(long, env)]
-    nats_nkey: Option<String>,
-    /// A prefix to use for NATS subjects.
+    nats_creds: Option<PathBuf>,
+    /// Prefix to use for NATS subjects.
     #[clap(long, env)]
     nats_prefix: Option<String>,
 
@@ -122,14 +122,20 @@ async fn main() {
 
     let (sender, receiver) = futures::channel::oneshot::channel();
 
-    let client = match (config.nats_host.as_deref(), config.nats_nkey.as_deref()) {
+    let client = match (config.nats_url.as_deref(), config.nats_creds.as_deref()) {
         (Some(host), None) => Some(
             async_nats::connect(host)
                 .await
                 .expect_or_log("could not connect to nats with no nkey"),
         ),
-        (Some(host), Some(nkey)) => Some(
-            async_nats::ConnectOptions::with_nkey(nkey.to_string())
+        (Some(host), Some(creds_path)) => Some(
+            async_nats::ConnectOptions::with_credentials_file(creds_path.to_owned())
+                .await
+                .expect_or_log("could not open credentials file")
+                .custom_inbox_prefix(format!(
+                    "_INBOX_{}",
+                    config.nats_prefix.as_deref().unwrap().replace('.', "_")
+                ))
                 .connect(host)
                 .await
                 .expect_or_log("could not connect to nats with nkey"),
@@ -139,26 +145,35 @@ async fn main() {
 
     let tree_clone = tree.clone();
     let config_clone = config.clone();
+    let token_clone = token.clone();
     let mut listener_task = if let Some(subscription) = config.database_subscribe.clone() {
         tracing::info!("starting to listen for payloads from postgres");
-        tokio::spawn(tree::listen_for_payloads_db(
-            pool,
-            subscription,
-            config.database_query.clone(),
-            tree_clone,
-            sender,
-            token.clone(),
-        ))
+        tokio::spawn(async move {
+            tree::listen_for_payloads_db(
+                pool,
+                subscription,
+                config_clone.database_query,
+                tree_clone,
+                sender,
+                token_clone,
+            )
+            .await
+            .expect_or_log("could not listen for payloads")
+        })
     } else if let Some(client) = client.clone() {
         tracing::info!("starting to listen for payloads from nats");
-        tokio::spawn(tree::listen_for_payloads_nats(
-            config_clone,
-            pool,
-            client,
-            tree_clone,
-            sender,
-            token.clone(),
-        ))
+        tokio::spawn(async move {
+            tree::listen_for_payloads_nats(
+                config_clone,
+                pool,
+                client,
+                tree_clone,
+                sender,
+                token_clone,
+            )
+            .await
+            .expect_or_log("could not listen for payloads")
+        })
     } else {
         panic!("no listener source available");
     };
@@ -311,7 +326,10 @@ async fn search_nats(
 
     let service = client
         .add_service(async_nats::service::Config {
-            name: "bkapi-search".to_string(),
+            name: format!(
+                "{}-bkapi",
+                config.nats_prefix.as_deref().unwrap().replace('.', "-")
+            ),
             version: env!("CARGO_PKG_VERSION").to_string(),
             description: None,
             stats_handler: None,

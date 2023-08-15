@@ -263,6 +263,7 @@ pub(crate) async fn listen_for_payloads_nats(
     // we don't need to start the listener until after it's loaded. This
     // prevents issues with a slow client but still retains every hash.
     let mut seq = stream.cached_info().state.last_sequence;
+    tracing::debug!(seq, "found starting seq");
 
     let create_consumer = |stream: async_nats::jetstream::stream::Stream, start_sequence: u64| async move {
         tracing::info!(start_sequence, "creating consumer");
