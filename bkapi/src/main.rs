@@ -334,6 +334,7 @@ async fn search_nats(
             description: None,
             stats_handler: None,
             metadata: None,
+            queue_group: None,
         })
         .await
         .map_err(NatsError::Generic)?;

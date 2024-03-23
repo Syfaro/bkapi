@@ -9,7 +9,7 @@ publish = false
 actix-http = "3"
 actix-service = "2"
 actix-web = "4"
-async-nats = { version = "0.31", features = ["service"] }
+async-nats = { version = "0.34", features = ["service"] }
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 bk-tree = { version = "0.5.0", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -18,7 +18,7 @@ flate2 = "1"
 futures = "0.3"
 hamming = "0.1"
 lazy_static = "1"
-opentelemetry = { version = "0.18", features = ["rt-tokio"] }
+opentelemetry = "0.22"
 prometheus = { version = "0.13", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,10 +26,10 @@ thiserror = "1"
 tokio = { version = "1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tracing = "0.1"
-tracing-actix-web = { version = "0.7", features = ["opentelemetry_0_18"] }
-tracing-opentelemetry = "0.18"
+tracing-actix-web = { version = "0.7", features = ["opentelemetry_0_22"] }
+tracing-opentelemetry = "0.23.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-unwrap = "0.10"
+tracing-unwrap = "1.0.1"
 
 foxlib = { git = "https://github.com/Syfaro/foxlib.git" }
 

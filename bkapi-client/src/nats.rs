@@ -17,7 +17,7 @@ pub struct HashDistance {
 }
 
 impl BKApiNatsClient {
-    const NATS_SUBJECT: &str = "bkapi.search";
+    const NATS_SUBJECT: &'static str = "bkapi.search";
 
     /// Create a new client with a given NATS client.
     pub fn new(client: async_nats::Client, prefix: &str) -> Self {
