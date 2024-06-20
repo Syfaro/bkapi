@@ -43,7 +43,7 @@ Each input will have a corresponding entry in the response:
 
 ## Initial Load
 
-The initial entries are populated through the databaes query `$DATABASE_QUERY`.
+The initial entries are populated through the database query `$DATABASE_QUERY`.
 
 ## Listening
 
