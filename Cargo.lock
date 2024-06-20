@@ -1041,7 +1041,7 @@ dependencies = [
 [[package]]
 name = "foxlib"
 version = "0.1.0"
-source = "git+https://github.com/Syfaro/foxlib.git#c9850ed76a1f3e2fc15714020b2d2d58992a3f93"
+source = "git+https://github.com/Syfaro/foxlib.git#12c3b598c5bc12d8db9d1d91d8d107d8ab232fc2"
 dependencies = [
  "chrono",
  "hyper",
